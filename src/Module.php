@@ -31,7 +31,11 @@ class Module extends \portalium\base\Module
 
             'extraPatterns' => [
                 'POST resend/{id}' => 'resend',
-                'GET,POST accept' => 'accept',
+                'POST accept' => 'accept',
+                'POST reject' => 'reject',
+                'POST reject-expired' => 'reject-expired',
+                'POST reject_expired' => 'reject-expired',
+                'POST rejectExpired' => 'reject-expired',
             ],
         ],
         [

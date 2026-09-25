@@ -10,18 +10,19 @@ use portalium\workspace\models\InvitationRole;
 use portalium\workspace\models\Workspace;
 use portalium\workspace\models\WorkspaceUser;
 use portalium\workspace\Module;
+use portalium\user\Module as UserModule;
+use portalium\user\models\User as UserModel;
 use portalium\rest\ActiveController as RestActiveController;
 use yii\web\ForbiddenHttpException;
 use yii\web\NotFoundHttpException;
 use yii\web\BadRequestHttpException;
 use yii\web\UnprocessableEntityHttpException;
 use yii\web\ServerErrorHttpException;
-use yii\helpers\Url;
+
 
 class InvitationController extends RestActiveController
 {
     public $modelClass = Invitation::class;
-
     public function actions()
     {
         $actions = parent::actions();
@@ -35,19 +36,47 @@ class InvitationController extends RestActiveController
             'searchModel' => $invitationSearch,
         ];
 
-        $actions['index']['prepareDataProvider'] = function ($action) use ($invitationSearch) {
+        $actions['index']['prepareDataProvider'] = function ($action) use ($invitationSearch)
+        {   
+            //This added silence the warning when using ->with
+            /** @var \yii\db\ActiveQuery $dataProvider->query */
             $dataProvider = $invitationSearch->search(Yii::$app->request->queryParams);
-            
+
             $idWorkspace = Yii::$app->request->getQueryParam('id_workspace');
-            if ($idWorkspace)
+            $workspace = null;
+            if($idWorkspace)
             {
                 $workspace = $this->findWorkspace($idWorkspace);
+            }
+            if ($workspace)
+            {
                 if (!(Yii::$app->user->can('workspaceApiInvitationView') ||
                 (Yii::$app->user->can('workspaceApiInvitationViewOwn') && $workspace->id_user == Yii::$app->user->id))) 
                 {
                     throw new ForbiddenHttpException(Module::t('You are not allowed to access this workspace.'));
                 }
-                $dataProvider->query->andWhere(['id_workspace' => $idWorkspace]);
+                $filter = [Module::$tablePrefix . 'invitation_role.status' => InvitationRole::STATUS_PENDING];
+
+                $dataProvider->query->andWhere(['id_workspace' => $idWorkspace])
+                ->andWhere([
+                    'id_invitation' => InvitationRole::find()
+                        ->select('id_invitation')
+                        ->where($filter)
+                ])
+                ->with(['invitationRole' => function ($query) use ($filter)
+                {
+                    $query->andWhere($filter)
+                    ->select([Module::$tablePrefix . 'invitation_role.id_invitation',
+                    UserModule::$tablePrefix . 'user.username AS username', 
+                    UserModule::$tablePrefix . 'user.id_avatar AS id_avatar',
+                    Module::$tablePrefix . 'invitation_role.role',
+                    Module::$tablePrefix . 'invitation_role.module'])
+
+                    ->leftJoin(UserModule::$tablePrefix . 'user',
+                    UserModule::$tablePrefix . 'user.email = ' . Module::$tablePrefix . 'invitation_role.email');
+                }
+                ])
+                ->asArray();
             }
             else // if no workspace is given, return invitations sent to the current user
             {
@@ -59,11 +88,26 @@ class InvitationController extends RestActiveController
                 } 
                 else 
                 {
-                    $dataProvider->query->andWhere([
+                    $filter = [Module::$tablePrefix . 'invitation_role.email' => $userEmail,
+                    Module::$tablePrefix . 'invitation_role.status' => InvitationRole::STATUS_PENDING];
+                    
+                    $dataProvider->query
+                    ->andWhere([
                         'id_invitation' => InvitationRole::find()
                             ->select('id_invitation')
-                            ->where(['email' => $userEmail])
-                    ]);
+                            ->where($filter)
+                    ])
+                    ->select([Module::$tablePrefix . 'invitation.*',
+                    Module::$tablePrefix . 'workspace.name AS workspace_name'])
+                    
+                    ->leftJoin(Module::$tablePrefix . 'workspace',
+                    Module::$tablePrefix . 'workspace.id_workspace = ' . Module::$tablePrefix . 'invitation.id_workspace')
+
+                    ->with(['invitationRole' => function ($query) use ($filter) {
+                            $query->andWhere($filter);
+                        }
+                    ])
+                    ->asArray();
                 }
             }
             $dataProvider->pagination = [
@@ -126,7 +170,8 @@ class InvitationController extends RestActiveController
             $invitationModel->invitation_token = Yii::$app->security->generateRandomString();
 
 
-            if ($invitationModel->validate() && $invitationModel->save()) {
+            if ($invitationModel->validate() && $invitationModel->save())
+            {
                 $this->createInvitation($model, $invitationModel, $modules, $usernames);
 
                 $webLink = Yii::$app->request->hostInfo . '/workspace/invitation/accept?token=' . $invitationModel->invitation_token;
@@ -238,10 +283,12 @@ class InvitationController extends RestActiveController
     }
 
     /**
-     * POST|GET /invitations/accept?token=:token
+     * POST /invitations/accept
      */
-    public function actionAccept($token)
+    public function actionAccept()
     {
+        $token = Yii::$app->request->getBodyParam('token');
+
         if (empty($token)) {
             throw new BadRequestHttpException(Module::t('Token is required.'));
         }
@@ -252,12 +299,14 @@ class InvitationController extends RestActiveController
             throw new NotFoundHttpException(Module::t('Invitation not found or invalid token.'));
         }
 
-        $invitationRoles = InvitationRole::find()->where(['id_invitation' => $invitation->id_invitation])->all();
+        $invitationRoles = InvitationRole::find()->where(['id_invitation' => $invitation->id_invitation,
+        'email' => Yii::$app->user->identity->email])->all();
+
         $hasError = false;
         $processed = false;
 
         foreach ($invitationRoles as $invitationRole) {
-            if ($invitationRole && $invitationRole->invitation->date_expire > date('Y-m-d H:i:s') && $invitationRole->email == Yii::$app->user->identity->email) {
+            if ($invitationRole && $invitationRole->status == InvitationRole::STATUS_PENDING && $invitationRole->invitation->date_expire > date('Y-m-d H:i:s')) {
                 $workspaceUser = WorkspaceUser::findOne([
                     'id_workspace' => $invitationRole->id_workspace,
                     'id_user' => Yii::$app->user->id,
@@ -268,8 +317,11 @@ class InvitationController extends RestActiveController
                 if ($workspaceUser) {
                     $workspaceUser->status = WorkspaceUser::STATUS_ACTIVE;
                     $workspaceUser->save();
+                    $invitationRole->accept();
                     $processed = true;
-                } else {
+                } 
+                else 
+                {
                     if (!Yii::$app->workspace->isAvailableRole($invitationRole->module, $invitationRole->role)) {
                         $hasError = true;
                         continue;
@@ -302,6 +354,99 @@ class InvitationController extends RestActiveController
             'success' => true, 
             'message' => Module::t('Invitation accepted successfully.'),
             'partial_errors' => $hasError
+        ];
+    }
+
+    /**
+     * POST /invitations/reject
+     */
+    public function actionReject()
+    {
+        $token = Yii::$app->request->post('token');
+
+        if (empty($token)) {
+            throw new BadRequestHttpException(Module::t('Token is required.'));
+        }
+
+        $invitation = Invitation::find()->where(['invitation_token' => $token])->one();
+
+        if (!$invitation) {
+            throw new NotFoundHttpException(Module::t('Invitation not found or invalid token.'));
+        }
+
+        $username = Yii::$app->request->post('username');
+
+        if($username != null || !empty($username)) //for cancelling workspaces outgoing invitation
+        {
+            if(!($invitation->id_workspace == Yii::$app->workspace->id && 
+            ((Yii::$app->user->can('workspaceApiInvitationUpdateOwn') && Yii::$app->workspace->id_user == Yii::$app->user->id)||
+            Yii::$app->workspace->can('workspace','workspaceApiInvitationUpdate') || Yii::$app->user->can('workspaceApiInvitationUpdate'))))
+            {
+                throw new ForbiddenHttpException(Module::t('You are not allowed to update this invitation.'));
+            }
+            $user_email = UserModel::findByUsername($username)->getEmail();
+
+            $invitationRoles = InvitationRole::find()->where(['id_invitation' => $invitation->id_invitation,
+            'email' => $user_email])->all();
+        }
+        else //for cancelling users incoming invitation
+        {
+            $invitationRoles = InvitationRole::find()->where(['id_invitation' => $invitation->id_invitation,
+            'email' => Yii::$app->user->identity->email])->all();
+        }
+
+        if (empty($invitationRoles)) {
+            throw new UnprocessableEntityHttpException(Module::t('No invitation roles found for your email.'));
+        }
+
+        foreach ($invitationRoles as $invitationRole) {
+            if ($invitationRole && $invitationRole->status == InvitationRole::STATUS_PENDING && $invitationRole->invitation->date_expire > date('Y-m-d H:i:s')) {
+                $invitationRole->reject();
+            }
+        }
+
+        return [
+            'success' => true,
+            'message' => Module::t('Invitation rejected successfully.')
+        ];
+    }
+
+    /**
+     * Post //invitations/reject-expired
+     * Post //invitations/reject_expired
+     * Post //invitations/rejectExpired
+     * 
+     * 
+     * @return array
+     */
+    public function actionRejectExpired()
+    {
+        Yii::error('User :' . Yii::$app->user->id . " calling for reject expire");
+
+        if (!Yii::$app->user->can('workspaceApiInvitationExpireCron'))
+        {
+            throw new ForbiddenHttpException(Module::t('You are not allowed to reject expired invitations.'));
+        }
+
+        $expiredInvitationIds = Invitation::find()
+            ->select('id_invitation')
+            ->where(['<=', 'date_expire', date('Y-m-d H:i:s')]);
+
+        $rejectedCount = InvitationRole::updateAll(
+            ['status' => InvitationRole::STATUS_REJECTED],
+            [
+                'and',
+                ['status' => InvitationRole::STATUS_PENDING],
+                ['id_invitation' => $expiredInvitationIds],
+            ]
+        );
+
+        return [
+            'success' => true,
+            'rejected_count' => $rejectedCount,
+            'message' => Module::t('{count} expired invitation roles rejected.', [
+                'count' => $rejectedCount,
+            ]),
         ];
     }
 
